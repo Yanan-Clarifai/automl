@@ -222,10 +222,42 @@ def detection_loss(cls_outputs, box_outputs, labels, params):
 
   cls_losses = []
   box_losses = []
+  sumrule = {}
+  if params.get('sumrule'):
+    sumrule = params['sumrule']
+    # because of cls_targets -= 1 (so that bg class becomes -1, actual class then starts from 0)
+    # we need to subtract 1 from sumrule as well.
+    _sumrule = {}
+    for k, v in sumrule.items():
+      _sumrule[k - 1] = [vv - 1 for vv in v]
+    sumrule = _sumrule
+
+  def table_lookup(values, old_onehot, cls_targets_at_level):
+    for val in values:
+      if sumrule.get(val):
+        new_val = sumrule[val]
+        #prob = 1.0/len(new_val)
+        prob = 0.5  # try sigmoid cross entropy first so set this to 0.5, if we use softmax we should set this to 1.0/len(new_val)
+        if len(new_val) == 1:
+          # leaf node, prob = 1.0
+          prob = 1.0
+        _matching_onehot = old_onehot[np.where(cls_targets_at_level == val)]
+        _matching_onehot[:, new_val] = prob
+        _matching_onehot[:, val] = 0
+        old_onehot[np.where(cls_targets_at_level == val)] = _matching_onehot
+    return old_onehot
   for level in levels:
     # Onehot encoding for classification labels.
-    cls_targets_at_level = tf.one_hot(labels['cls_targets_%d' % level],
-                                      params['num_classes'])
+    _cls_targets_at_level = tf.one_hot(labels['cls_targets_%d' % level], params['num_classes'])
+    if params.get('sumrule'):
+      unique_labels, _ = tf.unique(tf.reshape(labels['cls_targets_%d' % level], [-1]))
+      # refine one-hot labels so that we map each label to it's finest leaves
+      cls_targets_at_level = tf.numpy_function(
+          table_lookup, [unique_labels, _cls_targets_at_level, labels['cls_targets_%d' % level]],
+          _cls_targets_at_level.dtype)
+      cls_targets_at_level = tf.reshape(cls_targets_at_level, _cls_targets_at_level.shape)
+    else:
+      cls_targets_at_level = _cls_targets_at_level
 
     if params['data_format'] == 'channels_first':
       bs, _, width, height, _ = cls_targets_at_level.get_shape().as_list()
@@ -361,6 +393,11 @@ def _model_fn(features, labels, mode, params, model, variable_filter_fn=None):
   global_step = tf.train.get_or_create_global_step()
   learning_rate = learning_rate_schedule(params, global_step)
 
+  sumrule = None
+  if params.get('tree'):
+    _, sumrule = utils.parse_tree(params['tree'])
+    params['sumrule'] = sumrule
+
   # cls_loss and box_loss are for logging. only total_loss is optimized.
   det_loss, cls_loss, box_loss, box_iou_loss = detection_loss(
       cls_outputs, box_outputs, labels, params)
@@ -438,7 +475,7 @@ def _model_fn(features, labels, mode, params, model, variable_filter_fn=None):
 
     def metric_fn(**kwargs):
       """Returns a dictionary that has the evaluation metrics."""
-      if params['nms_configs'].get('pyfunc', True):
+      if params['nms_configs'].get('pyfunc', False):
         detections_bs = []
         for index in range(kwargs['boxes'].shape[0]):
           nms_configs = params['nms_configs']
@@ -457,20 +494,32 @@ def _model_fn(features, labels, mode, params, model, variable_filter_fn=None):
       else:
         # These two branches should be equivalent, but currently they are not.
         # TODO(tanmingxing): enable the non_pyfun path after bug fix.
-        nms_boxes, nms_scores, nms_classes, _ = postprocess.per_class_nms(
-            params, kwargs['boxes'], kwargs['scores'], kwargs['classes'],
-            kwargs['image_scales'])
-        img_ids = tf.cast(
-            tf.expand_dims(kwargs['image_ids'], -1), nms_scores.dtype)
-        detections_bs = [
-            img_ids * tf.ones_like(nms_scores),
-            nms_boxes[:, :, 1],
-            nms_boxes[:, :, 0],
-            nms_boxes[:, :, 3] - nms_boxes[:, :, 1],
-            nms_boxes[:, :, 2] - nms_boxes[:, :, 0],
-            nms_scores,
-            nms_classes,
-        ]
+        if params.get('tree'):
+          nms_boxes, nms_scores, nms_classes, _ = postprocess.hierarchical_nms(
+              params, kwargs['boxes'], kwargs['scores'], kwargs['image_scales'], k=10)
+          img_ids = tf.cast(tf.expand_dims(kwargs['image_ids'], -1), nms_scores.dtype)
+          detections_bs = [
+              img_ids * tf.ones_like(nms_boxes[:, :, 1], dtype=tf.float32),
+              nms_boxes[:, :, 1],
+              nms_boxes[:, :, 0],
+              nms_boxes[:, :, 3] - nms_boxes[:, :, 1],
+              nms_boxes[:, :, 2] - nms_boxes[:, :, 0],
+              nms_scores[:, :, 0],
+              nms_classes[:, :, 0],
+          ]
+        else:
+          nms_boxes, nms_scores, nms_classes, _ = postprocess.per_class_nms(
+              params, kwargs['boxes'], kwargs['scores'], kwargs['classes'], kwargs['image_scales'])
+          img_ids = tf.cast(tf.expand_dims(kwargs['image_ids'], -1), nms_scores.dtype)
+          detections_bs = [
+              img_ids * tf.ones_like(nms_scores),
+              nms_boxes[:, :, 1],
+              nms_boxes[:, :, 0],
+              nms_boxes[:, :, 3] - nms_boxes[:, :, 1],
+              nms_boxes[:, :, 2] - nms_boxes[:, :, 0],
+              nms_scores,
+              nms_classes,
+          ]
         detections_bs = tf.stack(detections_bs, axis=-1, name='detnections')
 
       if params.get('testdev_dir', None):
@@ -483,8 +532,13 @@ def _model_fn(features, labels, mode, params, model, variable_filter_fn=None):
         logging.info('Eval val with groudtruths %s.', params['val_json_file'])
         eval_metric = coco_metric.EvaluationMetric(
             filename=params['val_json_file'])
-        coco_metrics = eval_metric.estimator_metric_fn(
-            detections_bs, kwargs['groundtruth_data'])
+
+        if params.get('tree', None):
+          #TODO: Add in hierarchy file here?
+          coco_metrics = eval_metric.estimator_metric_fn(detections_bs, kwargs['groundtruth_data'],
+                                                         nms_scores, nms_classes, params['tree'])
+        else:
+          coco_metrics = eval_metric.estimator_metric_fn(detections_bs, kwargs['groundtruth_data'])
 
       # Add metrics to output.
       cls_loss = tf.metrics.mean(kwargs['cls_loss_repeat'])
@@ -508,8 +562,12 @@ def _model_fn(features, labels, mode, params, model, variable_filter_fn=None):
     cls_outputs = postprocess.to_list(cls_outputs)
     box_outputs = postprocess.to_list(box_outputs)
     params['nms_configs']['max_nms_inputs'] = anchors.MAX_DETECTION_POINTS
-    boxes, scores, classes = postprocess.pre_nms(params, cls_outputs,
-                                                 box_outputs)
+
+    if params.get('tree'):
+      boxes, scores, classes = postprocess.pre_nms(params, cls_outputs, box_outputs, topk=False)
+    else:
+      boxes, scores, classes = postprocess.pre_nms(params, cls_outputs, box_outputs, topk=True)
+
     metric_fn_inputs = {
         'cls_loss_repeat': cls_loss_repeat,
         'box_loss_repeat': box_loss_repeat,

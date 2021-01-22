@@ -17,6 +17,8 @@ from absl import logging
 import tensorflow as tf
 
 import utils
+import random
+import sys
 from keras import anchors
 from object_detection import preprocessor
 from object_detection import tf_example_decoder
@@ -324,9 +326,7 @@ class InputReader(object):
       (cls_targets, box_targets,
        num_positives) = anchor_labeler.label_anchors(boxes, classes)
 
-      source_id = tf.where(
-          tf.equal(source_id, tf.constant('')), '-1', source_id)
-      source_id = tf.strings.to_number(source_id)
+      source_id = tf.constant(random.randint(1, sys.maxsize))
 
       # Pad groundtruth data for evaluation.
       image_scale = input_processor.image_scale_to_original

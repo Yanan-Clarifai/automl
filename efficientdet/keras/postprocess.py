@@ -92,6 +92,75 @@ def topk_class_boxes(params, cls_outputs: T,
   return cls_outputs_topk, box_outputs_topk, classes, indices
 
 
+def hierarchical_nms(params, boxes, scores, image_scales, k=10):
+  """Hierarchical NMS, sum up all leave node scores as input to nms
+       after nms, trace back to the original predicted leave nodes.
+       boxes: (batch_size, num_boxes, 4)
+       scores: (batch_size, num_boxes, num_classes)
+
+  """
+  nms_boxes_bs, nms_scores_bs, nms_classes_bs, nms_valid_len_bs = [], [], [], []
+  batch_size = boxes.shape[0]
+  nms_configs = params['nms_configs']
+  method = nms_configs['method']
+  max_output_size = nms_configs['max_output_size']
+  if method == 'hard' or not method:
+    # hard nms.
+    sigma = 0.0
+    iou_thresh = nms_configs['iou_thresh'] or 0.5
+    score_thresh = nms_configs['score_thresh'] or float('-inf')
+  elif method == 'gaussian':
+    sigma = nms_configs['sigma'] or 0.5
+    iou_thresh = nms_configs['iou_thresh'] or 0.3
+    score_thresh = nms_configs['score_thresh'] or 0.001
+  else:
+    raise ValueError('Inference has invalid nms method {}'.format(method))
+
+  for i in range(batch_size):
+    # TF API's sigma is twice as the paper's value, so here we divide it by 2:
+    # https://github.com/tensorflow/tensorflow/issues/40253.
+    topk_vals_per_bbox, topk_indices_per_bbox = tf.math.top_k(scores[i], k=k)
+    sum_of_scores = tf.math.minimum(tf.reduce_sum(topk_vals_per_bbox, axis=1), 1.0)
+    nms_top_idx, nms_scores, nms_valid_lens = tf.raw_ops.NonMaxSuppressionV5(
+        boxes=boxes[i],
+        scores=sum_of_scores,
+        max_output_size=max_output_size,
+        iou_threshold=iou_thresh,
+        score_threshold=score_thresh,
+        soft_nms_sigma=(sigma / 2),
+        pad_to_max_output_size=False)
+
+    nms_boxes = tf.gather(boxes[i], nms_top_idx)
+
+    org_scores = tf.gather(topk_vals_per_bbox, nms_top_idx)
+    org_topk_indices = tf.gather(topk_indices_per_bbox, nms_top_idx)
+
+    _topk_classes = []
+    _topk_scores = []
+    # select topk predicted scores/classes per bbox
+    for ii in range(100):
+      _topk_classes.append(org_topk_indices[ii])
+      _topk_scores.append(org_scores[ii])
+
+    topk_classes = tf.stack(_topk_classes) + CLASS_OFFSET
+    topk_scores = tf.stack(_topk_scores)
+
+    nms_boxes_bs.append(nms_boxes)
+    nms_scores_bs.append(topk_scores)
+    nms_classes_bs.append(topk_classes)
+    nms_valid_len_bs.append(nms_valid_lens)
+
+  nms_boxes_bs = tf.stack(nms_boxes_bs)
+  nms_scores_bs = tf.stack(nms_scores_bs)
+  nms_classes_bs = tf.cast(tf.stack(nms_classes_bs), tf.float32)
+  nms_valid_len_bs = tf.stack(nms_valid_len_bs)
+  nms_boxes_bs = clip_boxes(nms_boxes_bs, params['image_size'])
+  if image_scales is not None:
+    scales = tf.expand_dims(tf.expand_dims(image_scales, -1), -1)
+    nms_boxes_bs = nms_boxes_bs * tf.cast(scales, nms_boxes_bs.dtype)
+  return nms_boxes_bs, nms_scores_bs, nms_classes_bs, nms_valid_len_bs
+
+
 def pre_nms(params, cls_outputs, box_outputs, topk=True):
   """Detection post processing before nms.
 
@@ -221,35 +290,13 @@ def postprocess_combined(params, cls_outputs, box_outputs, image_scales=None):
   return nms_boxes, nms_scores, nms_classes, nms_valid_len
 
 
-def postprocess_global(params, cls_outputs, box_outputs, image_scales=None):
-  """Post processing with global NMS.
-
-  A fast but less accurate version of NMS. The idea is to treat the scores for
-  different classes in a unified way, and perform NMS globally for all classes.
-
-  Args:
-    params: a dict of parameters.
-    cls_outputs: a list of tensors for classes, each tensor denotes a level
-      of logits with shape [N, H, W, num_class * num_anchors].
-    box_outputs: a list of tensors for boxes, each tensor ddenotes a level of
-      boxes with shape [N, H, W, 4 * num_anchors]. Each box format is
-      [y_min, x_min, y_max, x_man].
-    image_scales: scaling factor or the final image and bounding boxes.
-
-  Returns:
-    A tuple of batch level (boxes, scores, classess, valid_len) after nms.
-  """
-  cls_outputs = to_list(cls_outputs)
-  box_outputs = to_list(box_outputs)
-  boxes, scores, classes = pre_nms(params, cls_outputs, box_outputs)
-
-  # A list of batched boxes, scores, and classes.
+def _postprocess_global(params, boxes, scores, classes, image_scales=None):
   nms_boxes_bs, nms_scores_bs, nms_classes_bs, nms_valid_len_bs = [], [], [], []
   batch_size = boxes.shape[0]
   for i in range(batch_size):
     padded = batch_size > 1  # only pad if batch size > 1 for simplicity.
-    nms_boxes, nms_scores, nms_classes, nms_valid_len = nms(
-        params, boxes[i], scores[i], classes[i], padded)
+    nms_boxes, nms_scores, nms_classes, nms_valid_len = nms(params, boxes[i], scores[i],
+                                                            classes[i], padded)
 
     nms_boxes_bs.append(nms_boxes)
     nms_scores_bs.append(nms_scores)
@@ -265,6 +312,30 @@ def postprocess_global(params, cls_outputs, box_outputs, image_scales=None):
     scales = tf.expand_dims(tf.expand_dims(image_scales, -1), -1)
     nms_boxes_bs = nms_boxes_bs * tf.cast(scales, nms_boxes_bs.dtype)
   return nms_boxes_bs, nms_scores_bs, nms_classes_bs, nms_valid_len_bs
+
+
+def postprocess_global(params, cls_outputs, box_outputs, image_scales=None):
+  """Post processing with global NMS.
+
+  A fast but less accurate version of NMS. The idea is to treat the scores for
+  different classes in a unified way, and perform NMS globally for all classes.
+
+  Args:
+    params: a dict of parameters.
+    cls_outputs: a list of tensors for classes, each tensor denotes a level of
+      logits with shape [N, H, W, num_class * num_anchors].
+    box_outputs: a list of tensors for boxes, each tensor ddenotes a level of
+      boxes with shape [N, H, W, 4 * num_anchors]. Each box format is [y_min,
+      x_min, y_max, x_man].
+    image_scales: scaling factor or the final image and bounding boxes.
+
+  Returns:
+    A tuple of batch level (boxes, scores, classess, valid_len) after nms.
+  """
+  cls_outputs = to_list(cls_outputs)
+  box_outputs = to_list(box_outputs)
+  boxes, scores, classes = pre_nms(params, cls_outputs, box_outputs)
+  return _postprocess_global(params, boxes, scores, classes, image_scales)
 
 
 def per_class_nms(params, boxes, scores, classes, image_scales=None):

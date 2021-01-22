@@ -20,6 +20,7 @@ from __future__ import division
 from __future__ import print_function
 
 import contextlib
+import json
 import os
 import re
 from typing import Text, Tuple, Union
@@ -28,8 +29,10 @@ import numpy as np
 import tensorflow.compat.v1 as tf
 import tensorflow.compat.v2 as tf2
 
+from ontology import Ontology
 from tensorflow.python.tpu import tpu_function  # pylint:disable=g-direct-tensorflow-import
 # pylint: disable=logging-format-interpolation
+
 
 
 def srelu_fn(x):
@@ -683,3 +686,26 @@ def build_model_with_precision(pp, mm, ii, tt, *args, **kwargs):
 
   # Users are responsible to convert the dtype of all outputs.
   return outputs
+
+
+def parse_tree(tree_filename):
+  """Build tree given json file.
+
+  Args:
+    tree_filename: A string, path of json file describing tree from leaf to root
+
+  Returns:
+    tree_leaf2root: leaf to root dict
+    sumrule: sumrule dict.
+  """
+  with open(tree_filename, 'rb') as fp:
+    tree_str = json.loads(fp.read())
+    tree_leaf2root = {}
+    for k, v in tree_str.items():
+      if v is not None:
+        tree_leaf2root[int(k)] = int(v)
+      else:
+        tree_leaf2root[int(k)] = None
+    tree = Ontology(tree_leaf2root)
+    sumrule = tree.sumrules
+    return tree_leaf2root, sumrule

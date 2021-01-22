@@ -108,7 +108,9 @@ flags.DEFINE_bool('eval_after_training', False, 'Run one eval after the '
 flags.DEFINE_integer(
     'tf_random_seed', None, 'Sets the TF graph seed for deterministic execution'
     ' across runs (for debugging).')
-
+flags.DEFINE_string(
+    'tree', None,
+    'tree dict from leaf to root, used for hierachical training eg.{\'man\':\'person\'}')
 # For Eval mode
 flags.DEFINE_integer('min_eval_interval', 180,
                      'Minimum seconds between evaluations.')
@@ -259,6 +261,9 @@ def main(_):
   model_fn_instance = det_model_fn.get_model_fn(FLAGS.model_name)
   max_instances_per_image = config.max_instances_per_image
   use_tpu = (FLAGS.strategy == 'tpu')
+
+  if FLAGS.tree:
+    params['tree'] = FLAGS.tree
 
   # TPU Estimator
   logging.info(params)
